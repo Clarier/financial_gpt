@@ -20,10 +20,11 @@
 
 ```
 ecommerce_llm_project/
-├── data/
-│   ├── pretrain/          # Stage1 预训练数据
-│   ├── finetune/          # Stage2 SFT 数据
-│   └── reward/            # Stage3 DPO 数据
+├── datasets/
+│   ├── evol_diversity.py          
+│   ├── generate_financial_dataset_v3.py
+│   ├── template.py
+│   └── multiturn_dialogue.py         
 │
 ├── experiments/
 │   └── dpo_ablation.py    # ⭐ DPO 超参消融实验
