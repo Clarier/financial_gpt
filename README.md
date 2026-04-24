@@ -33,7 +33,7 @@ ecommerce_llm_project/
 │   └── inference_optimization.py  # ⭐ 推理性能优化
 │
 ├── evaluation/
-│   └── auto_evaluation.py # ⭐ 自动化评估体系
+│   └── evaluation_system.py # ⭐ 自动化评估体系
 │
 ├── analysis/
 │   └── data_quality_pipeline.py  # ⭐ 数据质量分析
