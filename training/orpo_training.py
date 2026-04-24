@@ -1,15 +1,15 @@
 # -*- coding: utf-8 -*-
 """
 @author:XuMing(xuming624@qq.com)
-@description: Train a model from SFT using DPO
+@description: Train a model from base model using ORPO
 """
 import os
-from copy import deepcopy
 from dataclasses import dataclass, field
 from glob import glob
 from typing import Dict, Optional
 
 import torch
+import torch.utils.data
 from datasets import load_dataset
 from loguru import logger
 from peft import LoraConfig, TaskType
@@ -18,11 +18,10 @@ from transformers import (
     AutoModelForCausalLM,
     AutoTokenizer,
     HfArgumentParser,
-    TrainingArguments,
     BitsAndBytesConfig,
 )
 from transformers.integrations import is_deepspeed_zero3_enabled
-from trl import DPOTrainer, DPOConfig
+from trl import ORPOConfig, ORPOTrainer
 
 from template import get_conv_template
 
@@ -82,8 +81,8 @@ class ScriptArguments:
     template_name: Optional[str] = field(default="vicuna", metadata={"help": "The prompt template name."})
     per_device_train_batch_size: Optional[int] = field(default=4, metadata={"help": "Train batch size per device"})
     per_device_eval_batch_size: Optional[int] = field(default=1, metadata={"help": "Eval batch size per device"})
-    max_source_length: Optional[int] = field(default=1024, metadata={"help": "Max length of prompt input text"})
-    max_target_length: Optional[int] = field(default=2048, metadata={"help": "Max length of output text"})
+    max_source_length: Optional[int] = field(default=2048, metadata={"help": "Max length of prompt input text"})
+    max_target_length: Optional[int] = field(default=512, metadata={"help": "Max length of output text"})
     min_target_length: Optional[int] = field(default=4, metadata={"help": "Min length of output text"})
     max_train_samples: Optional[int] = field(
         default=None,
@@ -118,20 +117,21 @@ class ScriptArguments:
     # Training arguments
     use_peft: bool = field(default=True, metadata={"help": "Whether to use peft"})
     qlora: bool = field(default=False, metadata={"help": "Whether to use qlora"})
-    target_modules: Optional[str] = field(default=None)
+    target_modules: Optional[str] = field(default="all", metadata={"help": "The target modules for peft"})
     lora_rank: Optional[int] = field(default=8)
     lora_dropout: Optional[float] = field(default=0.05)
     lora_alpha: Optional[float] = field(default=16.0)
     peft_path: Optional[str] = field(default=None)
     do_train: bool = field(default=False, metadata={"help": "Whether to run training."})
     do_eval: bool = field(default=False, metadata={"help": "Whether to run eval on the validation set."})
+    beta: Optional[float] = field(default=0.1, metadata={"help": "The beta parameter for DPO loss"})
     learning_rate: Optional[float] = field(default=5e-4, metadata={"help": "Learning rate"})
     lr_scheduler_type: Optional[str] = field(default="cosine", metadata={"help": "The lr scheduler type"})
     warmup_steps: Optional[int] = field(default=100, metadata={"help": "The number of warmup steps"})
     weight_decay: Optional[float] = field(default=0.05, metadata={"help": "The weight decay"})
     optim: Optional[str] = field(default="adamw_torch", metadata={"help": "The optimizer type"})
     fp16: Optional[bool] = field(default=False, metadata={"help": "Whether to use fp16"})
-    bf16: Optional[bool] = field(default=False, metadata={"help": "Whether to use bf16"})
+    bf16: Optional[bool] = field(default=True, metadata={"help": "Whether to use bf16"})
     gradient_checkpointing: Optional[bool] = field(
         default=True, metadata={"help": "Whether to use gradient checkpointing"}
     )
@@ -149,6 +149,10 @@ class ScriptArguments:
         metadata={"help": "Remove unused columns from the dataset if `datasets.Dataset` is used"},
     )
     report_to: Optional[str] = field(default="tensorboard", metadata={"help": "Report to wandb or tensorboard"})
+    orpo_beta: float = field(
+        default=0.1,
+        metadata={"help": "The beta (lambda) parameter in ORPO loss representing the weight of the SFT loss."},
+    )
 
     def __post_init__(self):
         if self.model_name_or_path is None:
@@ -194,8 +198,15 @@ def find_all_linear_names(peft_model, int4=False, int8=False):
 
 def main():
     parser = HfArgumentParser(ScriptArguments)
-    args = parser.parse_args_into_dataclasses(return_remaining_strings=True)[0]
-    logger.info(f"Parse args: {args}")
+    args = parser.parse_args_into_dataclasses()[0]
+
+    # Add distributed training initialization
+    local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+    is_main_process = local_rank in [-1, 0]
+
+    # Only log on main process
+    if is_main_process:
+        logger.info(f"Parse args: {args}")
 
     # Load tokenizer
     tokenizer_kwargs = {
@@ -250,12 +261,14 @@ def main():
         if args.train_file_dir is not None and os.path.exists(args.train_file_dir):
             train_data_files = glob(f'{args.train_file_dir}/**/*.json', recursive=True) + glob(
                 f'{args.train_file_dir}/**/*.jsonl', recursive=True)
-            logger.info(f"train files: {', '.join(train_data_files)}")
+            if is_main_process:
+                logger.info(f"train files: {', '.join(train_data_files)}")
             data_files["train"] = train_data_files
         if args.validation_file_dir is not None and os.path.exists(args.validation_file_dir):
             eval_data_files = glob(f'{args.validation_file_dir}/**/*.json', recursive=True) + glob(
                 f'{args.validation_file_dir}/**/*.jsonl', recursive=True)
-            logger.info(f"eval files: {', '.join(eval_data_files)}")
+            if is_main_process:
+                logger.info(f"eval files: {', '.join(eval_data_files)}")
             data_files["validation"] = eval_data_files
         raw_datasets = load_dataset(
             'json',
@@ -276,7 +289,8 @@ def main():
                 split=f"train[{args.validation_split_percentage}%:]",
                 cache_dir=args.cache_dir,
             )
-    logger.info(f"Raw datasets: {raw_datasets}")
+    if is_main_process:
+        logger.info(f"Raw datasets: {raw_datasets}")
 
     # Preprocessing the datasets
     max_source_length = args.max_source_length
@@ -313,30 +327,35 @@ def main():
     if args.do_train:
         if "train" not in raw_datasets:
             raise ValueError("--do_train requires a train dataset")
-        train_dataset = raw_datasets['train']
+        train_dataset = raw_datasets['train'].shuffle(seed=42)  # Add shuffle with fixed seed
         max_train_samples = len(train_dataset)
         if args.max_train_samples is not None and args.max_train_samples > 0:
             max_train_samples = min(len(train_dataset), args.max_train_samples)
             train_dataset = train_dataset.select(range(max_train_samples))
-        logger.debug(f"Example train_dataset[0]: {train_dataset[0]}")
-        tokenized_dataset = train_dataset.shuffle().map(
+        
+        if is_main_process:
+            logger.debug(f"Example train_dataset[0]: {train_dataset[0]}")
+            
+        tokenized_dataset = train_dataset.map(
             return_prompt_and_responses,
             batched=True,
             num_proc=args.preprocessing_num_workers,
             remove_columns=train_dataset.column_names,
             load_from_cache_file=not args.overwrite_cache,
-            desc="Running tokenizer on dataset",
+            desc="Running tokenizer on dataset" if is_main_process else None,
         )
         train_dataset = tokenized_dataset.filter(
             lambda x: 0 < len(x['prompt'] + x['chosen']) <= full_max_length
                       and 0 < len(x['prompt'] + x['rejected']) <= full_max_length
         )
-        logger.debug(f"Num train_samples: {len(train_dataset)}")
-        logger.debug("First train example:")
-        first_example = train_dataset[0]
-        logger.debug(f"prompt:\n{first_example['prompt']}")
-        logger.debug(f"chosen:\n{first_example['chosen']}")
-        logger.debug(f"rejected:\n{first_example['rejected']}")
+        
+        if is_main_process:
+            logger.debug(f"Num train_samples: {len(train_dataset)}")
+            logger.debug("First train example:")
+            first_example = train_dataset[0]
+            logger.debug(f"prompt:\n{first_example['prompt']}")
+            logger.debug(f"chosen:\n{first_example['chosen']}")
+            logger.debug(f"rejected:\n{first_example['rejected']}")
 
     eval_dataset = None
     max_eval_samples = 0
@@ -380,7 +399,8 @@ def main():
         args.device_map = None
     if args.device_map in ["None", "none", ""]:
         args.device_map = None
-    logger.info(f"Device map: {args.device_map}")
+    if is_main_process:
+        logger.info(f"Device map: {args.device_map}")
     if args.qlora and is_deepspeed_zero3_enabled():
         logger.warning("ZeRO3 are both currently incompatible with QLoRA.")
     config = AutoConfig.from_pretrained(
@@ -417,9 +437,9 @@ def main():
     else:
         model.config.use_cache = True
 
-    training_args = DPOConfig(
-        max_prompt_length=args.max_source_length,
+    training_args = ORPOConfig(
         max_length=full_max_length,
+        max_prompt_length=args.max_source_length,
         per_device_train_batch_size=args.per_device_train_batch_size,
         per_device_eval_batch_size=args.per_device_eval_batch_size,
         max_steps=args.max_steps,
@@ -436,12 +456,14 @@ def main():
         warmup_steps=args.warmup_steps,
         optim=args.optim,
         bf16=args.bf16,
-        fp16=args.fp16,
+        #fp16=args.fp16,
         remove_unused_columns=args.remove_unused_columns,
-        run_name=f"dpo_v1",
+        run_name=f"orpo_v1",
+        beta=args.orpo_beta,
+        ddp_find_unused_parameters=False if ddp else None,
     )
 
-    # Initialize DPO trainer
+    # Initialize ORPO trainer
     peft_config = None
     if args.use_peft:
         logger.info("Fine-tuning method: LoRA(PEFT)")
@@ -459,20 +481,20 @@ def main():
         )
     else:
         logger.info("Fine-tuning method: Full parameters training")
-    trainer = DPOTrainer(
+    trainer = ORPOTrainer(
         model,
-        ref_model=None if args.use_peft else deepcopy(model),
         args=training_args,
         train_dataset=train_dataset,
         eval_dataset=eval_dataset,
-        processing_class=tokenizer,
+        tokenizer=tokenizer,
         peft_config=peft_config if args.use_peft else None,
     )
-    print_trainable_parameters(trainer.model)
+    if is_main_process:
+        print_trainable_parameters(trainer.model)
 
     # Training
     if args.do_train:
-        if trainer.is_world_process_zero():
+        if is_main_process:
             logger.info("*** Train ***")
         train_result = trainer.train()
         metrics = train_result.metrics
@@ -489,8 +511,7 @@ def main():
 
     # Evaluation
     if args.do_eval:
-        if trainer.is_world_process_zero():
-            logger.info("*** Evaluate ***")
+        logger.info("*** Evaluate ***")
         metrics = trainer.evaluate()
         metrics["eval_samples"] = max_eval_samples
         trainer.log_metrics("eval", metrics)
