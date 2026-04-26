@@ -1,10 +1,10 @@
-# 🛒 金融领域大模型训练与优化项目
+# 🛒 电商领域大模型训练与优化项目
 
 > **面试级项目**：完整展示 LLM 算法岗核心能力
 
 ## 📋 项目概览
 
-基于 Qwen2.5 的金融领域大模型，覆盖 **PT → SFT → DPO** 全流程训练，并实现**消融实验、推理优化、自动评估、数据质量分析**四大工业级能力。
+基于 Qwen2.5 的电商领域大模型，覆盖 **PT → SFT → DPO** 全流程训练，并实现**消融实验、推理优化、自动评估、数据质量分析**四大工业级能力。
 
 ### 项目亮点
 
@@ -46,7 +46,7 @@ ecommerce_llm_project/
 │
 ├── configs/               # 训练配置
 ├── scripts/               # 辅助脚本
-└── financial_dpo_training_pipeline.ipynb  # 训练 Pipeline
+└── ecommerce_dpo_training_pipeline.ipynb  # 训练 Pipeline
 ```
 
 ## 🚀 快速开始
